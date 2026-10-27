@@ -24,9 +24,19 @@ Copying a hash (`y`) uses `pbcopy`, which is available on macOS.
 
 ## Install
 
+Install the latest tagged release:
+
 ```bash
 go install github.com/Linux-DEX/hunklog@latest
 ```
+
+Or install this release exactly:
+
+```bash
+go install github.com/Linux-DEX/hunklog@v0.1.0
+```
+
+Releases are Git tags named `vMAJOR.MINOR.PATCH`. `@latest` selects the highest of those tags.
 
 The binary is placed in `$GOBIN`, or in `$(go env GOPATH)/bin` when `GOBIN` is unset. That directory has to be on your `PATH`:
 
