@@ -10,7 +10,7 @@ git show <hash> -U99999 | hunk patch -
 
 `-U99999` asks Git for a huge unified diff, so hunk can show each complete file with the commit's edits in place. Choosing a file in hunklog still opens that same commit-wide patch, then moves hunk to the file you picked. Quitting hunk returns you to the same place in the list.
 
-The layout is two panes, in the style of lazygit: commits on the left, files on the right, keys along the bottom.
+The layout is two panes, in the style of lazygit: commits on the left, files on the right, keys along the bottom. The first two rows are the working tree and the index. Branch and tag names are shown next to the commit hash.
 
 ## Before you install
 
@@ -33,7 +33,7 @@ go install github.com/Linux-DEX/hunklog@latest
 Or install this release exactly:
 
 ```bash
-go install github.com/Linux-DEX/hunklog@v0.1.0
+go install github.com/Linux-DEX/hunklog@v0.2.0
 ```
 
 Releases are Git tags named `vMAJOR.MINOR.PATCH`. `@latest` selects the highest of those tags.
@@ -67,9 +67,10 @@ go run .
 | `ctrl-d` / `ctrl-u` | Half page |
 | `gg` / `G` | Top / bottom |
 | `tab`, `h` / `l` | Switch between commits and files |
-| `enter` | Open the commit in hunk. A selected file is focused; the sidebar still lists every file in the commit |
-| `c` | Open the same commit, starting at the first file |
-| `/` | Filter by hash, subject, author, or date. `esc` clears it |
+| `enter` | Open the selection in hunk. A commit opens every file in that commit. The working-tree row runs `hunk diff`. The staged row runs `hunk diff --staged`. A selected file is focused |
+| `c` | Open the commit, starting at the first file |
+| `f` | On a file, list only the commits that touched it. `f` again, or `esc`, returns to the full history |
+| `/` | Filter by hash, subject, author, date, or ref. `esc` clears it |
 | `y` | Copy the full hash (`pbcopy`) |
 | `r` | Reload the repository |
 | click | Select a row. The scroll wheel moves the pane under the pointer |

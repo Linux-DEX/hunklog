@@ -51,6 +51,9 @@ type model struct {
 	filter     string
 	filtering  bool
 	filterFrom string
+	follow     string
+	history    []commit
+	histErr    string
 	g          bool
 	help       bool
 	status     string
@@ -74,9 +77,16 @@ type filesMsg struct {
 
 type openMsg struct {
 	patch string
+	live  []string
 	root  string
 	focus string
 	err   error
+}
+
+type historyMsg struct {
+	path    string
+	commits []commit
+	err     error
 }
 
 type hunkDone struct{ err error }
@@ -156,23 +166,47 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fileOffset = reveal(m.fileOffset, m.fileCursor, rows)
 		}
 		return m, nil
+	case historyMsg:
+		if msg.path != m.follow {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.histErr = msg.err.Error()
+			m.history = nil
+			m.status = m.histErr
+			m.statusErr = true
+			return m, nil
+		}
+		m.histErr = ""
+		m.history = msg.commits
+		m.cursor = 0
+		m.offset = 0
+		return m, m.queueFiles()
 	case openMsg:
 		if msg.err != nil {
 			m.status = msg.err.Error()
 			m.statusErr = true
 			return m, nil
 		}
-		patch := msg.patch
-		c := exec.Command("hunk", "patch", patch)
-		c.Dir = m.root
+		var c *exec.Cmd
+		var done func(error) tea.Msg
+		if msg.live != nil {
+			c = exec.Command("hunk", msg.live...)
+			done = func(err error) tea.Msg { return hunkDone{err: err} }
+		} else {
+			patch := msg.patch
+			c = exec.Command("hunk", "patch", patch)
+			done = func(err error) tea.Msg {
+				os.Remove(patch)
+				return hunkDone{err: err}
+			}
+		}
+		c.Dir = msg.root
 		m.status = ""
 		if msg.focus != "" {
 			go focusHunkFile(msg.root, msg.focus)
 		}
-		return m, tea.ExecProcess(c, func(err error) tea.Msg {
-			os.Remove(patch)
-			return hunkDone{err: err}
-		})
+		return m, tea.ExecProcess(c, done)
 	case hunkDone:
 		if msg.err != nil {
 			m.status = msg.err.Error()
@@ -208,6 +242,8 @@ func (m model) onBoot(msg bootMsg) (tea.Model, tea.Cmd) {
 	m.root = msg.root
 	m.branch = msg.branch
 	m.commits = msg.commits
+	m.history = nil
+	m.histErr = ""
 	m.cache = map[string][]fileChange{}
 	m.loading = ""
 	m.failed = ""
@@ -221,6 +257,11 @@ func (m model) onBoot(msg bootMsg) (tea.Model, tea.Cmd) {
 	}
 	m.cursor = 0
 	m.offset = 0
+	if m.follow != "" {
+		_, _, rows := m.layout()
+		m.offset = reveal(0, m.cursor, rows)
+		return m, loadHistory(m.root, m.follow)
+	}
 	if prev != "" {
 		for i, c := range m.visible() {
 			if c.hash == prev {
@@ -228,6 +269,8 @@ func (m model) onBoot(msg bootMsg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
+	} else {
+		m.cursor = m.firstReal()
 	}
 	_, _, rows := m.layout()
 	m.offset = reveal(0, m.cursor, rows)
@@ -313,6 +356,15 @@ func (m model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if k != "g" {
 		m.g = false
 	}
+	if k == "esc" && m.follow != "" {
+		m.follow = ""
+		m.history = nil
+		m.histErr = ""
+		m.cursor = m.firstReal()
+		_, _, rows := m.layout()
+		m.offset = reveal(0, m.cursor, rows)
+		return m, m.queueFiles()
+	}
 	switch k {
 	case "q":
 		return m, tea.Quit
@@ -358,9 +410,13 @@ func (m model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.filterFrom = c.hash
 		}
 		return m, nil
+	case "f":
+		return m, m.followFile()
 	case "y":
 		c, ok := m.sel()
-		if !ok {
+		if !ok || c.kind != kindCommit {
+			m.status = "no commit hash on this row"
+			m.statusErr = true
 			return m, nil
 		}
 		return m, copyHash(c.hash, c.short)
@@ -377,27 +433,20 @@ func (m model) onFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.filtering = false
 		m.filter = ""
-		i := 0
-		for idx, c := range m.commits {
-			if c.hash == m.filterFrom {
-				i = idx
-				break
-			}
-		}
-		return m, m.setCursor(i)
+		return m, m.setCursor(m.indexOf(m.filterFrom))
 	case "enter":
 		m.filtering = false
 		return m, nil
 	case "backspace":
 		m.filter = trimLastRune(m.filter)
-		return m, m.setCursor(0)
+		return m, m.setCursor(m.firstReal())
 	case "ctrl+u":
 		m.filter = ""
-		return m, m.setCursor(0)
+		return m, m.setCursor(m.firstReal())
 	}
 	if msg.Type == tea.KeyRunes {
 		m.filter += msg.String()
-		return m, m.setCursor(0)
+		return m, m.setCursor(m.firstReal())
 	}
 	return m, nil
 }
@@ -457,10 +506,62 @@ func (m *model) queueFiles() tea.Cmd {
 		return nil
 	}
 	m.loading = c.hash
-	root, hash := m.root, c.hash
+	root, hash, kind := m.root, c.hash, c.kind
 	return func() tea.Msg {
-		files, err := nameStatus(root, hash)
+		var files []fileChange
+		var err error
+		switch kind {
+		case kindWorktree:
+			files, err = statusFiles(root, false)
+		case kindStaged:
+			files, err = statusFiles(root, true)
+		default:
+			files, err = nameStatus(root, hash)
+		}
 		return filesMsg{hash: hash, files: files, err: err}
+	}
+}
+
+func (m *model) followFile() tea.Cmd {
+	if m.focus != focusFiles {
+		m.status = "select a file to see its history"
+		m.statusErr = true
+		return nil
+	}
+	files, loaded := m.shownFiles()
+	if !loaded || len(files) == 0 || m.fileCursor < 0 || m.fileCursor >= len(files) {
+		m.status = "no file to follow"
+		m.statusErr = true
+		return nil
+	}
+	path := files[m.fileCursor].path
+	if m.follow == path {
+		m.follow = ""
+		m.history = nil
+		m.histErr = ""
+		m.cursor = m.firstReal()
+		_, _, rows := m.layout()
+		m.offset = reveal(0, m.cursor, rows)
+		m.status = ""
+		return m.queueFiles()
+	}
+	m.follow = path
+	m.history = nil
+	m.histErr = ""
+	m.filter = ""
+	m.filtering = false
+	m.cursor = 0
+	m.offset = 0
+	m.fileCursor = 0
+	m.fileOffset = 0
+	m.status = ""
+	return loadHistory(m.root, path)
+}
+
+func loadHistory(root, path string) tea.Cmd {
+	return func() tea.Msg {
+		commits, err := readHistory(root, path)
+		return historyMsg{path: path, commits: commits, err: err}
 	}
 }
 
@@ -475,7 +576,18 @@ func (m model) openHunk(jump bool) tea.Cmd {
 			focus = files[m.fileCursor].path
 		}
 	}
-	root, rev := m.root, c.hash
+	root := m.root
+	switch c.kind {
+	case kindWorktree:
+		return func() tea.Msg {
+			return openMsg{root: root, focus: focus, live: []string{"diff"}}
+		}
+	case kindStaged:
+		return func() tea.Msg {
+			return openMsg{root: root, focus: focus, live: []string{"diff", "--staged"}}
+		}
+	}
+	rev := c.hash
 	return func() tea.Msg {
 		patch, err := writePatch(root, rev)
 		if err != nil {
@@ -515,21 +627,47 @@ func copyHash(hash, short string) tea.Cmd {
 }
 
 func (m model) visible() []commit {
-	if m.filter == "" {
-		return m.commits
+	src := m.commits
+	if m.follow != "" {
+		src = m.history
 	}
-	q := strings.ToLower(m.filter)
-	out := make([]commit, 0, len(m.commits))
-	for _, c := range m.commits {
-		if strings.Contains(strings.ToLower(c.subject), q) ||
-			strings.Contains(strings.ToLower(c.hash), q) ||
-			strings.Contains(strings.ToLower(c.short), q) ||
-			strings.Contains(strings.ToLower(c.author), q) ||
-			strings.Contains(strings.ToLower(c.date), q) {
-			out = append(out, c)
+	out := src
+	if m.filter != "" {
+		q := strings.ToLower(m.filter)
+		out = make([]commit, 0, len(src))
+		for _, c := range src {
+			if strings.Contains(strings.ToLower(c.subject), q) ||
+				strings.Contains(strings.ToLower(c.hash), q) ||
+				strings.Contains(strings.ToLower(c.short), q) ||
+				strings.Contains(strings.ToLower(c.author), q) ||
+				strings.Contains(strings.ToLower(c.date), q) ||
+				strings.Contains(strings.ToLower(shortRefs(c.refs)), q) {
+				out = append(out, c)
+			}
 		}
 	}
-	return out
+	if m.follow != "" {
+		return out
+	}
+	return append([]commit{worktreeRow(), stagedRow()}, out...)
+}
+
+func (m model) firstReal() int {
+	for i, c := range m.visible() {
+		if c.kind == kindCommit {
+			return i
+		}
+	}
+	return 0
+}
+
+func (m model) indexOf(hash string) int {
+	for i, c := range m.visible() {
+		if c.hash == hash {
+			return i
+		}
+	}
+	return 0
 }
 
 func (m model) sel() (commit, bool) {
@@ -601,14 +739,17 @@ func (m model) View() string {
 	fileOff := reveal(m.fileOffset, m.fileCursor, rows)
 
 	commitTitle := "Commits"
+	if m.follow != "" {
+		commitTitle = "History"
+	}
 	shownFilter := m.filter
 	if runewidth.StringWidth(shownFilter) > 24 {
 		shownFilter = cut(shownFilter, 24)
 	}
 	if m.filtering {
-		commitTitle = "Commits /" + shownFilter + "█"
+		commitTitle += " /" + shownFilter + "█"
 	} else if m.filter != "" {
-		commitTitle = "Commits /" + shownFilter
+		commitTitle += " /" + shownFilter
 	}
 	fileTitle := "Files"
 	fileMeta := ""
@@ -665,8 +806,19 @@ func (m model) commitLines(width, rows, off int) []string {
 		return lines
 	}
 	list := m.visible()
+	if m.follow != "" && m.history == nil && m.histErr == "" {
+		lines[0] = plain(width, "reading history…", muted)
+		return lines
+	}
+	if m.follow != "" && m.histErr != "" && len(list) == 0 {
+		lines[0] = plain(width, "could not read history", delC)
+		return lines
+	}
 	if len(list) == 0 {
 		msg := "no commits"
+		if m.follow != "" {
+			msg = "no history for this file"
+		}
 		if m.filter != "" {
 			msg = "no matching commits"
 		}
@@ -727,15 +879,25 @@ func (m model) commitRow(c commit, width int, current, focused bool) string {
 		markColor = accent
 	}
 	short := fit(c.short, m.shortW)
+	refs := shortRefs(c.refs)
+	if refs != "" {
+		refs = cut(refs, 28)
+	}
 	date := c.date
-	need := 1 + 1 + runewidth.StringWidth(short) + 2 + 1 + 10
+	need := 1 + 1 + runewidth.StringWidth(short) + 2
+	if refs != "" {
+		need += runewidth.StringWidth(refs) + 2
+	}
+	need += 1 + 10
 	parts := []seg{
 		{text: mark, color: markColor},
 		{text: " ", color: textC},
 		{text: short, color: hashC},
-		{text: "  ", color: textC},
-		{text: c.subject, color: textC, flex: true},
 	}
+	if refs != "" {
+		parts = append(parts, seg{text: "  ", color: textC}, seg{text: refs, color: accent})
+	}
+	parts = append(parts, seg{text: "  ", color: textC}, seg{text: c.subject, color: textC, flex: true})
 	if date != "" && width >= need {
 		parts = append(parts, seg{text: " ", color: textC}, seg{text: fit(date, 10), color: muted})
 	}
@@ -761,7 +923,7 @@ func fileRow(f fileChange, width int, current, focused bool) string {
 func statusColor(s string) lipgloss.TerminalColor {
 	c := textC
 	switch s {
-	case "A":
+	case "A", "?":
 		c = addC
 	case "D":
 		c = delC
@@ -782,7 +944,9 @@ func (m model) topBar() string {
 		left += styled("  "+m.branch, muted)
 	}
 	right := ""
-	if m.ready {
+	if m.follow != "" {
+		right = styled(m.follow, muted)
+	} else if m.ready {
 		label := "commits"
 		if len(m.commits) == 1 {
 			label = "commit"
@@ -833,6 +997,7 @@ func (m model) hintLine() string {
 		{"j/k", "move"},
 		{"tab", "panel"},
 		{"enter", "hunk"},
+		{"f", "history"},
 		{"/", "filter"},
 		{"y", "hash"},
 		{"r", "reload"},
@@ -844,23 +1009,25 @@ func (m model) hintLine() string {
 
 func (m model) helpView() string {
 	body := strings.Join([]string{
-		"Commits are newest first. enter opens every file in that commit.",
-		"Each file is the full git show -U99999 diff. A selected file is focused;",
-		"the hunk sidebar still lists the rest of the commit.",
+		"Commits are newest first. The top two rows are the working tree",
+		"and the index. Branch and tag names sit beside the hash.",
+		"enter opens every file in hunk. A selected file is focused.",
 		"",
 		"  j k         move",
 		"  g g  G      top / bottom",
 		"  ctrl-d u    half page",
 		"  tab  h l    switch commits / files",
-		"  enter       open the commit in hunk",
-		"  c           same, starting at the first file",
-		"  /           filter hash, subject, author",
+		"  enter       open in hunk",
+		"  c           commit, starting at the first file",
+		"  f           history of the selected file",
+		"  esc         leave file history",
+		"  /           filter hash, subject, author, ref",
 		"  y           copy the full hash",
 		"  r           reload",
-		"  click       select a row",
 		"  q           quit",
 		"",
-		"  git show <hash> -U99999 | hunk patch -",
+		"  commits      git show <hash> -U99999 | hunk patch -",
+		"  work / index hunk diff    and    hunk diff --staged",
 		"",
 		"esc closes help",
 	}, "\n")

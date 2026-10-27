@@ -11,13 +11,33 @@ import (
 )
 
 func TestParseLog(t *testing.T) {
-	in := "full\x1fshort\x1fAda\x1f2026-10-27\x1ffix it\x00full2\x1fs2\x1fBea\x1f2026-10-26\x1fother"
+	in := "full\x1fshort\x1fAda\x1f2026-10-27\x1ffix it\x1fHEAD -> main\x00full2\x1fs2\x1fBea\x1f2026-10-26\x1fother\x1f"
 	cs, err := parseLog(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cs) != 2 || cs[0].short != "short" || cs[0].subject != "fix it" || cs[1].author != "Bea" {
+	if len(cs) != 2 || cs[0].short != "short" || cs[0].subject != "fix it" || cs[0].refs != "HEAD -> main" || cs[1].author != "Bea" {
 		t.Fatalf("%+v", cs)
+	}
+	if shortRefs(cs[0].refs) != "HEAD main" {
+		t.Fatal(shortRefs(cs[0].refs))
+	}
+	if shortRefs("HEAD -> main, origin/main, tag: v0.1.0") != "HEAD main origin/main v0.1.0" {
+		t.Fatal(shortRefs("HEAD -> main, origin/main, tag: v0.1.0"))
+	}
+}
+
+func TestParsePorcelain(t *testing.T) {
+	in := "R  new.txt\x00old.txt\x00 M tracked.txt\x00?? untracked.txt\x00"
+	staged, work := parsePorcelain(in)
+	if len(staged) != 1 || staged[0].status != "R" || staged[0].path != "new.txt" || staged[0].old != "old.txt" {
+		t.Fatalf("staged %+v", staged)
+	}
+	if staged[0].label() != "old.txt → new.txt" {
+		t.Fatal(staged[0].label())
+	}
+	if len(work) != 2 || work[0].status != "M" || work[0].path != "tracked.txt" || work[1].status != "?" || work[1].path != "untracked.txt" {
+		t.Fatalf("work %+v", work)
 	}
 }
 
@@ -59,7 +79,7 @@ func TestVisibleFilter(t *testing.T) {
 		{short: "bbb2222", hash: "bbb", subject: "beta", author: "Bea"},
 	}, filter: "alp"}
 	got := m.visible()
-	if len(got) != 1 || got[0].short != "aaa1111" {
+	if len(got) != 3 || got[0].kind != kindWorktree || got[1].kind != kindStaged || got[2].short != "aaa1111" {
 		t.Fatalf("%+v", got)
 	}
 }
@@ -72,17 +92,19 @@ func TestViewShowsCommitAndFile(t *testing.T) {
 		root:   "/tmp/repo",
 		branch: "main",
 		ready:  true,
+		cache: map[string][]fileChange{
+			hash: {{status: "M", path: "internal/tui/ui.go"}},
+		},
+		shortW: 7,
+		cursor: 2,
 		commits: []commit{{
 			hash:    hash,
 			short:   "aaaaaaa",
 			author:  "Ada",
 			date:    "2026-10-27",
 			subject: "show the whole file",
+			refs:    "HEAD -> main, tag: v0.1.0",
 		}},
-		cache: map[string][]fileChange{
-			hash: {{status: "M", path: "internal/tui/ui.go"}},
-		},
-		shortW: 7,
 	}
 	got := m.View()
 	lines := strings.Split(got, "\n")
@@ -95,7 +117,7 @@ func TestViewShowsCommitAndFile(t *testing.T) {
 		}
 	}
 	plain := stripANSI(got)
-	for _, want := range []string{"hunklog", "repo", "main", "aaaaaaa", "show the whole file", "internal/tui/ui.go", "2026-10-27", "Ada"} {
+	for _, want := range []string{"hunklog", "repo", "main", "aaaaaaa", "show the whole file", "internal/tui/ui.go", "2026-10-27", "Ada", "Working tree", "Staged", "HEAD", "v0.1.0"} {
 		if !strings.Contains(plain, want) {
 			t.Fatalf("view missing %q\n%s", want, plain)
 		}
@@ -172,6 +194,13 @@ func TestGitRoundTrip(t *testing.T) {
 	}
 	if !bytes.Contains(body, []byte("rename and edit")) || !bytes.Contains(body, []byte("new name.txt")) || !bytes.Contains(body, []byte("+beta")) || !bytes.Contains(body, []byte("other.txt")) {
 		t.Fatalf("patch missing expected diff:\n%s", body)
+	}
+	hist, err := readHistory(dir, "other.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 1 || hist[0].subject != "rename and edit" {
+		t.Fatalf("history %+v", hist)
 	}
 }
 

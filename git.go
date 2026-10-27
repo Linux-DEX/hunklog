@@ -9,12 +9,56 @@ import (
 	"strings"
 )
 
+type rowKind int
+
+const (
+	kindCommit rowKind = iota
+	kindWorktree
+	kindStaged
+)
+
 type commit struct {
+	kind    rowKind
 	hash    string
 	short   string
 	author  string
 	date    string
 	subject string
+	refs    string
+}
+
+func worktreeRow() commit {
+	return commit{kind: kindWorktree, hash: ":worktree", short: "work", subject: "Working tree"}
+}
+
+func stagedRow() commit {
+	return commit{kind: kindStaged, hash: ":staged", short: "staged", subject: "Staged changes"}
+}
+
+// shortRefs turns git's %D decoration into a compact label list.
+// "HEAD -> main, origin/main, tag: v0.1.0" becomes "HEAD main origin/main v0.1.0".
+func shortRefs(d string) string {
+	d = strings.TrimSpace(d)
+	if d == "" {
+		return ""
+	}
+	var labels []string
+	for _, p := range strings.Split(d, ", ") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if rest, ok := strings.CutPrefix(p, "HEAD -> "); ok {
+			labels = append(labels, "HEAD", rest)
+			continue
+		}
+		if rest, ok := strings.CutPrefix(p, "tag: "); ok {
+			labels = append(labels, rest)
+			continue
+		}
+		labels = append(labels, p)
+	}
+	return strings.Join(labels, " ")
 }
 
 type fileChange struct {
@@ -64,10 +108,10 @@ func parseLog(s string) ([]commit, error) {
 			continue
 		}
 		f := strings.Split(rec, "\x1f")
-		if len(f) != 5 {
+		if len(f) != 6 {
 			return nil, fmt.Errorf("unexpected git log record")
 		}
-		out = append(out, commit{hash: f[0], short: f[1], author: f[2], date: f[3], subject: f[4]})
+		out = append(out, commit{hash: f[0], short: f[1], author: f[2], date: f[3], subject: f[4], refs: f[5]})
 	}
 	return out, nil
 }
@@ -111,12 +155,79 @@ func nameStatus(root, rev string) ([]fileChange, error) {
 	return parseNameStatus(string(out))
 }
 
+const logFormat = "%H%x1f%h%x1f%an%x1f%ad%x1f%s%x1f%D"
+
 func readCommits(root string) ([]commit, error) {
-	out, err := gitOutput(root, "log", "--date=short", "-z", "--pretty=format:%H%x1f%h%x1f%an%x1f%ad%x1f%s")
+	out, err := gitOutput(root, "log", "--date=short", "-z", "--pretty=format:"+logFormat)
 	if err != nil {
 		return nil, err
 	}
 	return parseLog(string(out))
+}
+
+func readHistory(root, path string) ([]commit, error) {
+	out, err := gitOutput(root, "log", "--follow", "--date=short", "-z", "--pretty=format:"+logFormat, "--", path)
+	if err != nil {
+		return nil, err
+	}
+	return parseLog(string(out))
+}
+
+func statusFiles(root string, staged bool) ([]fileChange, error) {
+	out, err := gitOutput(root, "status", "--porcelain=v1", "-z")
+	if err != nil {
+		return nil, err
+	}
+	st, work := parsePorcelain(string(out))
+	if staged {
+		return st, nil
+	}
+	return work, nil
+}
+
+// parsePorcelain splits `git status --porcelain=v1 -z`.
+// A rename is the new path, then a NUL, then the old path.
+func parsePorcelain(s string) (staged, work []fileChange) {
+	s = strings.Trim(s, "\x00")
+	if s == "" {
+		return nil, nil
+	}
+	p := strings.Split(s, "\x00")
+	for i := 0; i < len(p); {
+		rec := p[i]
+		i++
+		if len(rec) < 4 || rec[2] != ' ' {
+			continue
+		}
+		x, y := rec[0], rec[1]
+		path := rec[3:]
+		old := ""
+		if x == 'R' || x == 'C' || y == 'R' || y == 'C' {
+			if i < len(p) {
+				old = p[i]
+				i++
+			}
+		}
+		if x == '?' && y == '?' {
+			work = append(work, fileChange{status: "?", path: path})
+			continue
+		}
+		if x != ' ' && x != '?' {
+			st := fileChange{status: string(x), path: path}
+			if x == 'R' || x == 'C' {
+				st.old = old
+			}
+			staged = append(staged, st)
+		}
+		if y != ' ' && y != '?' {
+			st := fileChange{status: string(y), path: path}
+			if y == 'R' || y == 'C' {
+				st.old = old
+			}
+			work = append(work, st)
+		}
+	}
+	return staged, work
 }
 
 // writePatch stores `git show <rev> -U99999` for hunk.
